@@ -1,0 +1,642 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>ネズミの泥棒大作戦 (Mouse Thief)</title>
+<style>
+*{box-sizing:border-box;user-select:none}
+body{background:#1a1a1a;color:#fff;font-family:'Courier New',monospace;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;margin:0;padding:10px}
+h1{margin:5px 0;color:#ffeb3b;text-shadow:2px 2px #ff5722;font-size:24px}
+canvas{border:4px solid #fff;background:#000;box-shadow:0 0 25px rgba(255,255,255,.2);border-radius:4px;max-width:100%;height:auto}
+.dpad-container{margin-top:15px;display:flex;flex-direction:column;align-items:center;gap:5px}
+.dpad-row{display:flex;gap:5px}
+.btn-pad{width:60px;height:60px;background:#444;color:#fff;border:2px solid #666;border-radius:8px;font-size:24px;font-weight:bold;display:flex;justify-content:center;align-items:center;cursor:pointer;box-shadow:0 4px #222;touch-action:manipulation}
+.btn-pad:active,.btn-pad.active{background:#666;box-shadow:0 1px #222;transform:translateY(3px)}
+.btn-empty{width:60px;height:60px;visibility:hidden}
+.instructions{margin-top:10px;font-size:12px;color:#aaa;text-align:center}
+</style>
+</head>
+<body>
+<h1>MOUSE THIEF</h1>
+<canvas id="gameCanvas" width="600" height="600"></canvas>
+<div class="dpad-container">
+<div class="dpad-row"><div class="btn-empty"></div><div class="btn-pad" id="btnUp">▲</div><div class="btn-empty"></div></div>
+<div class="dpad-row"><div class="btn-pad" id="btnLeft">◄</div><div class="btn-pad" id="btnDown">▼</div><div class="btn-pad" id="btnRight">►</div></div>
+</div>
+<div class="instructions">画面操作またはキー入力でサウンドスタート！</div>
+
+<script>
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+
+// --- サウンド ---
+let audioCtx = null, bgmInterval = null, audioStarted = false;
+
+function initAudio() {
+    if (audioStarted) return;
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+    audioStarted = true;
+    startBGM();
+}
+window.addEventListener('keydown', initAudio);
+window.addEventListener('touchstart', initAudio);
+window.addEventListener('mousedown', initAudio);
+
+function tone(type, f, t, d, v, f2) {
+    const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+    o.type = type;
+    o.frequency.setValueAtTime(f, t);
+    if (f2) o.frequency.exponentialRampToValueAtTime(f2, t + d);
+    g.gain.setValueAtTime(v, t);
+    g.gain.exponentialRampToValueAtTime(0.01, t + d);
+    o.connect(g); g.connect(audioCtx.destination);
+    o.start(t); o.stop(t + d);
+}
+function playTrampolineSound() { if (audioCtx) tone('sine', 150, audioCtx.currentTime, 0.25, 0.3, 600); }
+function playItemSound() {
+    if (!audioCtx) return;
+    const n = audioCtx.currentTime;
+    tone('square', 987.77, n, 0.08, 0.15);
+    tone('square', 1318.51, n + 0.08, 0.17, 0.15);
+}
+function playStageClearSound() {
+    if (!audioCtx) return;
+    const n = audioCtx.currentTime;
+    [523.25, 659.25, 783.99, 1046.5].forEach((f, i) => tone('triangle', f, n + i * 0.12, 0.25, 0.2));
+}
+function playHurtSound() { if (audioCtx) tone('sawtooth', 220, audioCtx.currentTime, 0.3, 0.25, 60); }
+
+const bgmNotes = [
+    [261.63, .15], [329.63, .15], [392, .15], [440, .25], [392, .15], [329.63, .15],
+    [293.66, .15], [329.63, .25], [349.23, .15], [392, .15], [440, .15], [523.25, .30]
+];
+let noteIndex = 0;
+function startBGM() {
+    if (bgmInterval) return;
+    bgmInterval = setInterval(() => {
+        if (!audioCtx || gameOver || gameClear || isStageClearing) return;
+        const [f, d] = bgmNotes[noteIndex];
+        tone('triangle', f, audioCtx.currentTime, d, 0.2);
+        noteIndex = (noteIndex + 1) % bgmNotes.length;
+    }, 220);
+}
+
+// --- 定数・状態 ---
+const FLOOR_COLORS = ['#8b5a2b','#4a6b82','#3e7a5e','#8c4a6b','#9e6d3b','#5c5c8a','#8a3b3b','#2e7d80','#6b8e23','#444444'];
+const MAX_STAGE = 10, FLOORS = 5, FLOOR_HEIGHT = 100;
+const VIEW_WIDTH = 600, WORLD_WIDTH = 1800, CANVAS_HEIGHT = 600, OFFSET_Y = 80;
+
+let currentStage = 1, score = 0, lives = 3, invincibleTimer = 0;
+let gameOver = false, gameClear = false, isStageClearing = false;
+
+const keys = { left: false, right: false, up: false, down: false };
+const KEYMAP = { ArrowLeft: ['left', 'btnLeft'], ArrowRight: ['right', 'btnRight'], ArrowUp: ['up', 'btnUp'], ArrowDown: ['down', 'btnDown'] };
+
+function updatePadUI(id, active) {
+    const el = document.getElementById(id);
+    if (el) el.classList.toggle('active', active);
+}
+window.addEventListener('keydown', e => {
+    const m = KEYMAP[e.key];
+    if (m) { e.preventDefault(); keys[m[0]] = true; updatePadUI(m[1], true); }
+});
+window.addEventListener('keyup', e => {
+    const m = KEYMAP[e.key];
+    if (m) { keys[m[0]] = false; updatePadUI(m[1], false); }
+});
+
+function setupTouchButton(id, keyProp) {
+    const btn = document.getElementById(id);
+    const start = e => { e.preventDefault(); keys[keyProp] = true; btn.classList.add('active'); };
+    const end = e => { e.preventDefault(); keys[keyProp] = false; btn.classList.remove('active'); };
+    btn.addEventListener('touchstart', start);
+    btn.addEventListener('touchend', end);
+    btn.addEventListener('mousedown', start);
+    btn.addEventListener('mouseup', end);
+    btn.addEventListener('mouseleave', end);
+}
+setupTouchButton('btnUp', 'up');
+setupTouchButton('btnDown', 'down');
+setupTouchButton('btnLeft', 'left');
+setupTouchButton('btnRight', 'right');
+
+const GAPS = [{ x: 0, width: 80 }, { x: 860, width: 80 }, { x: 1720, width: 80 }];
+
+// ★各フロアから下のフロアへ降りるはしごを3本ずつ配置（最下階は不要）
+const floorData = [
+    { y: OFFSET_Y + 0 * FLOOR_HEIGHT, gaps: GAPS, ladderXs: [350, 1100, 1600] },
+    { y: OFFSET_Y + 1 * FLOOR_HEIGHT, gaps: GAPS, ladderXs: [200, 500, 1300] },
+    { y: OFFSET_Y + 2 * FLOOR_HEIGHT, gaps: GAPS, ladderXs: [700, 1000, 1500] },
+    { y: OFFSET_Y + 3 * FLOOR_HEIGHT, gaps: GAPS, ladderXs: [250, 600, 1200] },
+    { y: OFFSET_Y + 4 * FLOOR_HEIGHT, gaps: GAPS, ladderXs: [] },
+    // ★最下段（トランポリンの床）は独立したフロア(index 5)として扱う
+    { y: OFFSET_Y + 5 * FLOOR_HEIGHT, gaps: GAPS, ladderXs: [] }
+];
+const BOTTOM_Y = OFFSET_Y + 5 * FLOOR_HEIGHT;
+
+const trampolines = GAPS.map(g => ({ x: g.x, width: g.width, y: BOTTOM_Y, bounceOffset: 0, bounceVelocity: 0 }));
+
+function triggerTrampolineBounce(index, force) {
+    if (trampolines[index]) trampolines[index].bounceVelocity = force;
+    playTrampolineSound();
+}
+function updateTrampolineAnimation() {
+    trampolines.forEach(t => {
+        t.bounceVelocity += -0.15 * t.bounceOffset;
+        t.bounceOffset += t.bounceVelocity;
+        t.bounceVelocity *= 0.82;
+    });
+}
+
+const player = {
+    x: 100, y: floorData[0].y - 30, width: 24, height: 30,
+    vx: 0, vy: 0, speed: 3.5, airSpeed: 4.5, floor: 0,
+    isFalling: false, isBouncing: false, facingRight: true
+};
+
+function resetPlayerPosition() {
+    player.x = 100;
+    player.floor = 0;
+    player.y = floorData[0].y - player.height;
+    player.vx = 0; player.vy = 0;
+    player.isFalling = false; player.isBouncing = false;
+    invincibleTimer = 120;
+}
+
+function isOverGap(x, width, gaps) {
+    return gaps.some(g => (x + width - 4 > g.x) && (x + 4 < g.x + g.width));
+}
+function getGapIndex(x, width, gaps) {
+    return gaps.findIndex(g => (x + width - 4 > g.x) && (x + 4 < g.x + g.width));
+}
+
+class Cat {
+    constructor(floor, x, dir, extraSpeed = 0) {
+        this.floor = floor;
+        this.x = x;
+        this.y = floorData[floor].y - 32;
+        this.width = 30; this.height = 32;
+        this.dir = dir;
+        this.speed = 1.5 + Math.random() + extraSpeed;
+        this.isFalling = false; this.isBouncing = false;
+        this.vy = 0; this.vx = 0;
+    }
+
+    update() {
+        if (this.isFalling || this.isBouncing) {
+            let prevY = this.y;
+            this.y += this.vy;
+            this.x += this.vx;
+            this.vy += 0.1;
+
+            if (this.x < 10) { this.x = 10; this.vx = Math.abs(this.vx); }
+            if (this.x + this.width > WORLD_WIDTH - 10) { this.x = WORLD_WIDTH - 10 - this.width; this.vx = -Math.abs(this.vx); }
+
+            for (let i = 0; i < FLOORS; i++) {
+                let fY = floorData[i].y - this.height;
+                let overGap = isOverGap(this.x, this.width, floorData[i].gaps);
+                if (!overGap && (Math.abs(this.y - fY) < 12 || (prevY <= fY && this.y >= fY))) {
+                    this.y = fY;
+                    this.floor = i;
+                    this.isFalling = false; this.isBouncing = false;
+                    this.vy = 0; this.vx = 0;
+                    this.dir = Math.random() > 0.5 ? 1 : -1;
+                    break;
+                }
+            }
+
+            if (this.y + this.height >= BOTTOM_Y) {
+                let gapIdx = getGapIndex(this.x, this.width, GAPS);
+                this.y = BOTTOM_Y - this.height;
+                if (gapIdx !== -1) {
+                    this.isBouncing = true; this.isFalling = false;
+                    this.vy = -10.5;
+                    this.vx = (Math.random() > 0.5 ? 1 : -1) * (2.0 + Math.random() * 2.0);
+                    triggerTrampolineBounce(gapIdx, 12);
+                } else {
+                    this.floor = FLOORS;
+                    this.isFalling = false; this.isBouncing = false;
+                    this.vy = 0; this.vx = 0;
+                }
+            }
+            return;
+        }
+
+        this.x += this.speed * this.dir;
+        if (this.x < 10) { this.x = 10; this.dir = 1; }
+        else if (this.x + this.width > WORLD_WIDTH - 10) { this.x = WORLD_WIDTH - 10 - this.width; this.dir = -1; }
+
+        if (isOverGap(this.x, this.width, floorData[this.floor].gaps)) {
+            this.isFalling = true;
+            this.vy = 0.8;
+            this.vx = this.dir * 0.5;
+        }
+    }
+
+    drawCatShape(x, y) {
+        ctx.fillStyle = '#ff8c00';
+        ctx.fillRect(x + 4, y + 10, 22, 20);
+        ctx.beginPath(); ctx.moveTo(x + 4, y + 10); ctx.lineTo(x + 1, y + 2); ctx.lineTo(x + 10, y + 10); ctx.fill();
+        ctx.beginPath(); ctx.moveTo(x + 20, y + 10); ctx.lineTo(x + 29, y + 2); ctx.lineTo(x + 26, y + 10); ctx.fill();
+
+        ctx.fillStyle = '#ffff00';
+        if (this.dir > 0) {
+            ctx.fillRect(x + 16, y + 14, 4, 6); ctx.fillRect(x + 22, y + 14, 4, 6);
+            ctx.fillStyle = '#000';
+            ctx.fillRect(x + 18, y + 15, 2, 4); ctx.fillRect(x + 24, y + 15, 2, 4);
+        } else {
+            ctx.fillRect(x + 4, y + 14, 4, 6); ctx.fillRect(x + 10, y + 14, 4, 6);
+            ctx.fillStyle = '#000';
+            ctx.fillRect(x + 4, y + 15, 2, 4); ctx.fillRect(x + 10, y + 15, 2, 4);
+        }
+
+        ctx.fillStyle = '#ffb6c1';
+        ctx.fillRect(this.dir > 0 ? x + 25 : x + 3, y + 20, 3, 3);
+
+        ctx.strokeStyle = '#ff8c00';
+        ctx.lineWidth = 4;
+        ctx.beginPath();
+        let tailX = this.dir > 0 ? x + 2 : x + 28;
+        ctx.moveTo(tailX, y + 25);
+        ctx.lineTo(tailX + (this.dir > 0 ? -6 : 6), y + 15);
+        ctx.stroke();
+    }
+
+    draw(cameraX) { this.drawCatShape(this.x - cameraX, this.y); }
+}
+
+let cats = [], items = [];
+
+const ALL_HOUSE_ITEMS = [
+    { type: 'CHS', pts: 100 }, { type: 'COIN', pts: 300 }, { type: 'BTN', pts: 200 },
+    { type: 'PIN', pts: 150 }, { type: 'STR', pts: 500 }, { type: 'CKY', pts: 250 },
+    { type: 'RNG', pts: 800 }, { type: 'MCH', pts: 350 }, { type: 'YRN', pts: 400 },
+    { type: 'SUG', pts: 600 }
+];
+
+function setupStage(stage) {
+    resetPlayerPosition();
+    lives = 3; // ステージクリアでLIFE全回復
+    cats = []; items = [];
+
+    let extraCats = Math.floor((stage - 1) / 2);
+    let extraCatSpeed = (stage - 1) * 0.15;
+
+    for (let f = 0; f < FLOORS; f++) {
+        let catCount = 2 + (f === 0 ? 0 : Math.floor(extraCats / 2));
+        for (let c = 0; c < catCount; c++) {
+            let posX = 300 + c * 500 + Math.random() * 200;
+            if (posX > WORLD_WIDTH - 100) posX = WORLD_WIDTH - 200;
+            cats.push(new Cat(f, posX, c % 2 === 0 ? 1 : -1, extraCatSpeed));
+        }
+    }
+
+    let targetItemCount = 5 + (stage - 1);
+    let availableTypes = ALL_HOUSE_ITEMS.slice(0, Math.min(ALL_HOUSE_ITEMS.length, 5 + Math.floor((stage - 1) / 2)));
+
+    for (let i = 0; i < targetItemCount; i++) {
+        let randFloor = Math.floor(Math.random() * FLOORS);
+        let randX, tries = 0;
+        do {
+            randX = 150 + Math.random() * (WORLD_WIDTH - 300);
+            tries++;
+        } while (isOverGap(randX, 24, floorData[randFloor].gaps) && tries < 50);
+
+        let info = availableTypes[i % availableTypes.length];
+        items.push({ floor: randFloor, x: randX, type: info.type, pts: info.pts, collected: false });
+    }
+}
+setupStage(currentStage);
+
+function drawPixelItem(type, x, y) {
+    if (type === 'CHS') {
+        ctx.fillStyle = '#ffcc00';
+        ctx.beginPath(); ctx.moveTo(x, y + 20); ctx.lineTo(x + 24, y + 20); ctx.lineTo(x + 24, y + 4); ctx.closePath(); ctx.fill();
+        ctx.fillStyle = '#e6b800';
+        ctx.beginPath(); ctx.arc(x + 12, y + 15, 3, 0, Math.PI * 2); ctx.fill();
+        ctx.beginPath(); ctx.arc(x + 18, y + 10, 2, 0, Math.PI * 2); ctx.fill();
+    } else if (type === 'COIN') {
+        ctx.fillStyle = '#ffd700';
+        ctx.beginPath(); ctx.arc(x + 12, y + 12, 10, 0, Math.PI * 2); ctx.fill();
+        ctx.fillStyle = '#fff799';
+        ctx.beginPath(); ctx.arc(x + 10, y + 10, 7, 0, Math.PI * 2); ctx.fill();
+        ctx.fillStyle = '#d4af37';
+        ctx.font = 'bold 10px sans-serif'; ctx.fillText('¥', x + 8, y + 16);
+    } else if (type === 'BTN') {
+        ctx.fillStyle = '#ff4081';
+        ctx.beginPath(); ctx.arc(x + 12, y + 12, 10, 0, Math.PI * 2); ctx.fill();
+        ctx.fillStyle = '#111';
+        ctx.fillRect(x + 8, y + 11, 2, 2); ctx.fillRect(x + 14, y + 11, 2, 2);
+    } else if (type === 'PIN') {
+        ctx.strokeStyle = '#e0e0e0'; ctx.lineWidth = 3;
+        ctx.beginPath(); ctx.arc(x + 8, y + 12, 6, 0.5 * Math.PI, 1.5 * Math.PI); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(x + 8, y + 6); ctx.lineTo(x + 20, y + 6); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(x + 8, y + 18); ctx.lineTo(x + 20, y + 18); ctx.stroke();
+        ctx.fillStyle = '#aaa'; ctx.fillRect(x + 18, y + 4, 6, 16);
+    } else if (type === 'STR') {
+        ctx.fillStyle = '#ff1744';
+        ctx.beginPath();
+        ctx.moveTo(x + 12, y + 22);
+        ctx.quadraticCurveTo(x + 2, y + 12, x + 4, y + 6);
+        ctx.quadraticCurveTo(x + 12, y + 4, x + 20, y + 6);
+        ctx.quadraticCurveTo(x + 22, y + 12, x + 12, y + 22);
+        ctx.fill();
+        ctx.fillStyle = '#76ff03'; ctx.fillRect(x + 8, y + 2, 8, 4);
+        ctx.fillStyle = '#fff'; ctx.fillRect(x + 8, y + 10, 2, 2); ctx.fillRect(x + 14, y + 14, 2, 2);
+    } else if (type === 'CKY') {
+        ctx.fillStyle = '#d7ccc8';
+        ctx.beginPath(); ctx.arc(x + 12, y + 12, 10, 0, Math.PI * 2); ctx.fill();
+        ctx.fillStyle = '#4e342e';
+        ctx.fillRect(x + 8, y + 8, 3, 3); ctx.fillRect(x + 14, y + 12, 3, 3); ctx.fillRect(x + 9, y + 15, 3, 3);
+    } else if (type === 'RNG') {
+        ctx.strokeStyle = '#ffd700'; ctx.lineWidth = 3;
+        ctx.beginPath(); ctx.arc(x + 12, y + 14, 7, 0, Math.PI * 2); ctx.stroke();
+        ctx.fillStyle = '#ff1744'; ctx.fillRect(x + 9, y + 3, 6, 6);
+    } else if (type === 'MCH') {
+        ctx.fillStyle = '#29b6f6'; ctx.fillRect(x + 2, y + 6, 20, 14);
+        ctx.fillStyle = '#ff7043'; ctx.fillRect(x + 6, y + 9, 12, 8);
+        ctx.fillStyle = '#8d6e63'; ctx.fillRect(x + 22, y + 8, 3, 10);
+    } else if (type === 'YRN') {
+        ctx.fillStyle = '#e91e63';
+        ctx.beginPath(); ctx.arc(x + 12, y + 12, 10, 0, Math.PI * 2); ctx.fill();
+        ctx.strokeStyle = '#f8bbd0'; ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.arc(x + 10, y + 10, 6, 0, Math.PI); ctx.stroke();
+    } else if (type === 'SUG') {
+        ctx.fillStyle = '#ffffff'; ctx.fillRect(x + 4, y + 6, 14, 14);
+        ctx.fillStyle = '#cfd8dc'; ctx.fillRect(x + 14, y + 6, 4, 14); ctx.fillRect(x + 4, y + 16, 14, 4);
+    }
+}
+
+function updatePlayer() {
+    if (gameOver || gameClear || isStageClearing) return;
+    if (invincibleTimer > 0) invincibleTimer--;
+
+    let moveSpeed = (player.isBouncing || player.isFalling) ? player.airSpeed : player.speed;
+    if (keys.left) { player.x -= moveSpeed; player.facingRight = false; }
+    if (keys.right) { player.x += moveSpeed; player.facingRight = true; }
+
+    if (player.x < 5) player.x = 5;
+    if (player.x + player.width > WORLD_WIDTH - 5) player.x = WORLD_WIDTH - 5 - player.width;
+
+    if (player.isBouncing || player.isFalling) {
+        let prevY = player.y;
+        player.y += player.vy;
+        player.vy += 0.1;
+        if (player.vy > 3.5) player.vy = 3.5;
+        if (player.y < 20) { player.y = 20; player.vy = 0; }
+
+        for (let i = 0; i < FLOORS; i++) {
+            let fY = floorData[i].y - player.height;
+            let overGap = isOverGap(player.x, player.width, floorData[i].gaps);
+            if (!overGap) {
+                if (Math.abs(player.y - fY) < 14 || (prevY < fY && player.y > fY) || (prevY > fY && player.y < fY)) {
+                    if (keys.left || keys.right || player.vy > 0) {
+                        player.y = fY;
+                        player.floor = i;
+                        player.isBouncing = false; player.isFalling = false;
+                        player.vy = 0;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (player.y + player.height >= BOTTOM_Y) {
+            let gapIdx = getGapIndex(player.x, player.width, GAPS);
+            player.y = BOTTOM_Y - player.height;
+            if (gapIdx !== -1) {
+                player.isBouncing = true; player.isFalling = false;
+                player.vy = -10.5;
+                triggerTrampolineBounce(gapIdx, 16);
+            } else {
+                player.floor = FLOORS;
+                player.isBouncing = false; player.isFalling = false;
+                player.vy = 0;
+            }
+        }
+        return;
+    }
+
+    let playerCenterX = player.x + player.width / 2;
+
+    // ★下り：現在のフロアの3本のうち近いはしごを使う
+    if (keys.down && player.floor < FLOORS - 1) {
+        const downX = floorData[player.floor].ladderXs.find(lx => Math.abs(playerCenterX - lx) < 30);
+        if (downX !== undefined) {
+            player.floor++;
+            player.y = floorData[player.floor].y - player.height;
+            player.x = downX - player.width / 2;
+        }
+    }
+
+    // ★上り：ひとつ上のフロアから伸びる3本のうち近いはしごを使う
+    if (keys.up && player.floor > 0) {
+        const upX = floorData[player.floor - 1].ladderXs.find(lx => Math.abs(playerCenterX - lx) < 30);
+        if (upX !== undefined) {
+            player.floor--;
+            player.y = floorData[player.floor].y - player.height;
+            player.x = upX - player.width / 2;
+        }
+    }
+
+    if (isOverGap(player.x, player.width, floorData[player.floor].gaps)) {
+        player.isFalling = true;
+        player.vy = 0.5;
+    }
+
+    items.forEach(item => {
+        if (!item.collected && player.floor === item.floor && Math.abs(player.x - item.x) < 30) {
+            item.collected = true;
+            score += item.pts;
+            playItemSound();
+            checkStageClear();
+        }
+    });
+
+    if (invincibleTimer === 0) {
+        cats.forEach(cat => {
+            if (cat.floor === player.floor && !player.isFalling && !player.isBouncing && !cat.isFalling && !cat.isBouncing) {
+                const p = { x: player.x + 4, w: player.width - 8, y: player.y + 4, h: player.height - 4 };
+                const c = { x: cat.x + 4, w: cat.width - 8, y: cat.y + 4, h: cat.height - 4 };
+                if (p.x < c.x + c.w && p.x + p.w > c.x && p.y < c.y + c.h && p.y + p.h > c.y) {
+                    playHurtSound();
+                    lives--;
+                    if (lives <= 0) gameOver = true;
+                    else resetPlayerPosition();
+                }
+            }
+        });
+    }
+}
+
+function checkStageClear() {
+    if (items.every(item => item.collected)) {
+        isStageClearing = true;
+        playStageClearSound();
+        setTimeout(() => {
+            if (currentStage >= MAX_STAGE) gameClear = true;
+            else { currentStage++; setupStage(currentStage); }
+            isStageClearing = false;
+        }, 2000);
+    }
+}
+
+function drawMouseShape(x, y) {
+    if (invincibleTimer > 0 && Math.floor(invincibleTimer / 6) % 2 === 0) return;
+    ctx.fillStyle = '#aaa';
+    ctx.fillRect(x + 4, y + 8, 16, 22);
+
+    ctx.fillStyle = '#ffb6c1';
+    ctx.beginPath();
+    ctx.arc(x + 4, y + 6, 6, 0, Math.PI * 2);
+    ctx.arc(x + 20, y + 6, 6, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.fillStyle = '#000';
+    ctx.fillRect(player.facingRight ? x + 14 : x + 7, y + 12, 3, 3);
+
+    ctx.fillStyle = '#ff69b4';
+    ctx.fillRect(player.facingRight ? x + 18 : x + 3, y + 16, 3, 3);
+
+    ctx.strokeStyle = '#ffb6c1';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    let tailX = player.facingRight ? x + 2 : x + 22;
+    ctx.moveTo(tailX, y + 26);
+    ctx.lineTo(tailX + (player.facingRight ? -8 : 8), y + 20);
+    ctx.stroke();
+}
+
+function drawTrampoline(t, cameraX) {
+    let tY = t.y + t.bounceOffset;
+    let drawX = t.x - cameraX;
+
+    ctx.fillStyle = '#777';
+    ctx.fillRect(drawX + 4, t.y, 4, 15);
+    ctx.fillRect(drawX + t.width - 8, t.y, 4, 15);
+
+    ctx.strokeStyle = '#00ffcc';
+    ctx.lineWidth = 4;
+    ctx.beginPath();
+    ctx.moveTo(drawX, t.y);
+    ctx.quadraticCurveTo(drawX + t.width / 2, tY + t.bounceOffset * 0.8, drawX + t.width, t.y);
+    ctx.stroke();
+
+    ctx.fillStyle = '#00ff00';
+    ctx.fillRect(drawX + 2, tY, t.width - 4, 4);
+}
+
+function drawFloorSegments(y, gaps, color, cameraX) {
+    ctx.fillStyle = color;
+    let cx = 0;
+    gaps.forEach(gap => {
+        let w = gap.x - cx;
+        if (w > 0) ctx.fillRect(cx - cameraX, y, w, 10);
+        cx = gap.x + gap.width;
+    });
+    if (cx < WORLD_WIDTH) ctx.fillRect(cx - cameraX, y, WORLD_WIDTH - cx, 10);
+}
+
+function draw() {
+    updateTrampolineAnimation();
+
+    let cameraX = player.x - VIEW_WIDTH / 2 + player.width / 2;
+    if (cameraX < 0) cameraX = 0;
+    if (cameraX > WORLD_WIDTH - VIEW_WIDTH) cameraX = WORLD_WIDTH - VIEW_WIDTH;
+
+    ctx.fillStyle = '#111';
+    ctx.fillRect(0, 0, VIEW_WIDTH, CANVAS_HEIGHT);
+
+    const floorColor = FLOOR_COLORS[(currentStage - 1) % FLOOR_COLORS.length];
+
+    floorData.forEach((f, index) => {
+        drawFloorSegments(f.y, f.gaps, floorColor, cameraX);
+
+        // ★はしごを3本すべて描画
+        if (index < FLOORS - 1) {
+            ctx.strokeStyle = '#aaa';
+            ctx.lineWidth = 4;
+            f.ladderXs.forEach(ladderX => {
+                let lx = ladderX - cameraX;
+                ctx.beginPath();
+                ctx.moveTo(lx - 10, f.y); ctx.lineTo(lx - 10, f.y + FLOOR_HEIGHT);
+                ctx.moveTo(lx + 10, f.y); ctx.lineTo(lx + 10, f.y + FLOOR_HEIGHT);
+                for (let ly = f.y; ly < f.y + FLOOR_HEIGHT; ly += 15) {
+                    ctx.moveTo(lx - 10, ly); ctx.lineTo(lx + 10, ly);
+                }
+                ctx.stroke();
+            });
+        }
+    });
+
+    drawFloorSegments(BOTTOM_Y, GAPS, floorColor, cameraX);
+    trampolines.forEach(t => drawTrampoline(t, cameraX));
+
+    ctx.fillStyle = '#ff5722';
+    ctx.fillRect(0 - cameraX, 0, 6, CANVAS_HEIGHT);
+    ctx.fillRect(WORLD_WIDTH - 6 - cameraX, 0, 6, CANVAS_HEIGHT);
+
+    items.forEach(item => {
+        if (!item.collected) drawPixelItem(item.type, item.x - cameraX, floorData[item.floor].y - 28);
+    });
+
+    cats.forEach(cat => {
+        if (!isStageClearing) cat.update();
+        cat.draw(cameraX);
+    });
+
+    drawMouseShape(player.x - cameraX, player.y);
+
+    let remaining = items.filter(i => !i.collected).length;
+    ctx.fillStyle = 'rgba(0,0,0,0.6)';
+    ctx.fillRect(0, 0, VIEW_WIDTH, 50);
+
+    ctx.font = 'bold 18px Arial';
+    ctx.fillStyle = '#00ffcc';
+    ctx.fillText(`STAGE: ${currentStage}/${MAX_STAGE}`, 15, 32);
+    ctx.fillStyle = '#ff3366';
+    ctx.fillText(`LIFE: ${'♥'.repeat(lives)}`, 160, 32);
+    ctx.font = 'bold 16px Arial';
+    ctx.fillStyle = '#fff';
+    ctx.fillText(`SCORE: ${score}`, 320, 32);
+    ctx.fillStyle = '#ffeb3b';
+    ctx.fillText(`REST: ${remaining}`, 490, 32);
+
+    if (isStageClearing) {
+        ctx.fillStyle = 'rgba(0,0,0,0.7)';
+        ctx.fillRect(0, 0, VIEW_WIDTH, CANVAS_HEIGHT);
+        ctx.fillStyle = '#ffeb3b';
+        ctx.font = 'bold 40px Arial';
+        ctx.fillText(`STAGE ${currentStage} CLEAR!`, 130, 300);
+    } else if (gameOver) {
+        ctx.fillStyle = 'rgba(0,0,0,0.85)';
+        ctx.fillRect(0, 0, VIEW_WIDTH, CANVAS_HEIGHT);
+        ctx.fillStyle = '#ff3333';
+        ctx.font = 'bold 40px Arial';
+        ctx.fillText('GAME OVER', 180, 300);
+        ctx.fillStyle = '#fff';
+        ctx.font = '16px Arial';
+        ctx.fillText('ページを再読み込みして再挑戦', 190, 340);
+    } else if (gameClear) {
+        ctx.fillStyle = 'rgba(0,0,0,0.85)';
+        ctx.fillRect(0, 0, VIEW_WIDTH, CANVAS_HEIGHT);
+        ctx.fillStyle = '#00ff00';
+        ctx.font = 'bold 36px Arial';
+        ctx.fillText('ALL STAGES CLEAR!!', 110, 280);
+        ctx.fillStyle = '#ffeb3b';
+        ctx.font = 'bold 24px Arial';
+        ctx.fillText(`FINAL SCORE: ${score}`, 190, 340);
+    }
+}
+
+function loop() {
+    updatePlayer();
+    draw();
+    requestAnimationFrame(loop);
+}
+loop();
+</script>
+</body>
+</html>
